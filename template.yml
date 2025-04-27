@@ -1,0 +1,299 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Bedrock Agent with Embedded Action Group and Lambda
+
+Resources:
+
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BedrockAgentRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: BedrockInvokeLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt MyActionLambda.Arn
+        - PolicyName: AllowBedrockModelAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: arn:aws:bedrock:*::foundation-model/amazon.*
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRoleForRiskBot
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaBasicExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+        - PolicyName: AllowInvokeBedrockModel
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: arn:aws:bedrock:*::foundation-model/amazon.*
+
+  MyActionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RiskBotActionExecutor
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 25
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          bedrock = boto3.client("bedrock-runtime")
+          FOUNDATION_MODEL_ID = os.environ.get("FOUNDATION_MODEL_ID", "amazon.nova-lite-v1:0")
+
+          def invoke_model(prompt: str, system_message: str) -> str:
+              model_id = FOUNDATION_MODEL_ID
+              print(f"Invoking model {model_id} with prompt:\n{prompt}")
+              print(f"System message: {system_message}")
+
+              if not model_id.startswith("amazon.nova"):
+                  raise ValueError(f"Unsupported model ID: {model_id} (only amazon.nova-* is supported)")
+
+              body = {
+                  "schemaVersion": "messages-v1",
+                  "messages": [
+                      {
+                          "role": "user",
+                          "content": [
+                              { "text": prompt }
+                          ]
+                      }
+                  ],
+                  "system": [
+                      {
+                          "text": system_message
+                      }
+                  ],
+                  "inferenceConfig": {
+                      "maxTokens": 500,
+                      "topP": 0.9,
+                      "topK": 20,
+                      "temperature": 0.7
+                  }
+              }
+
+              response = bedrock.invoke_model(
+                  modelId=model_id,
+                  contentType="application/json",
+                  accept="application/json",
+                  body=json.dumps(body)
+              )
+
+              model_output = json.loads(response["body"].read())
+              print(model_output)
+
+              try:
+                  return model_output["output"]["message"]["content"][0]["text"]
+              except Exception as e:
+                  print("Failed to parse model output:", e)
+                  print("Full model output:", json.dumps(model_output, indent=2))
+                  return "[No output from model]"
+
+          def handler(event, context):
+              print("=== Received event ===")
+              print(json.dumps(event, indent=2))
+
+              path = event.get("apiPath", "")
+              method = event.get("httpMethod", "POST")
+              action_group = event.get("actionGroup")
+              session_attrs = event.get("sessionAttributes", {})
+              prompt_attrs = event.get("promptSessionAttributes", {})
+
+              props = event.get("requestBody", {}).get("content", {}).get("application/json", {}).get("properties", [])
+              params = {p["name"]: p["value"] for p in props}
+              country = params.get("country", "Unknown")
+
+              # Select prompt + system message
+              if path == "/getPoliticalStability":
+                  prompt = f"Summarize the current political climate in {country}. Discuss recent elections, leadership changes, civil unrest, and any ongoing government instability. Do not defer to outside sources — respond as an expert would."
+                  system = "You are a geopolitical analyst. You always provide a professional summary of the current political climate in the given country based on your extensive knowledge. You do not defer to external sources. If data is unclear, give your best expert approximation using confident, helpful language."
+                  key = "politicalStability"
+
+              elif path == "/getEconomicRisk":
+                  prompt = f"Provide a detailed analysis of the key economic risks facing {country} in the near future. Include insights on inflation, interest rates, public debt, unemployment, trade dynamics, or currency pressures if applicable. Avoid disclaimers and speak confidently."
+                  system = "You are a senior economist advising global investors on country-level macroeconomic risk. Provide realistic, confident summaries of current and emerging economic issues, even if data is incomplete. Do not mention the lack of access to real-time statistics — provide your best expert analysis instead."
+                  key = "economicRisk"
+
+              else:
+                  raise Exception("Unrecognized API path")
+
+              result_text = invoke_model(prompt, system)
+              response_content = {key: result_text}
+              print(response_content)
+
+              return {
+                  "messageVersion": "1.0",
+                  "response": {
+                      "actionGroup": action_group,
+                      "apiPath": path,
+                      "httpMethod": method,
+                      "httpStatusCode": 200,
+                      "responseBody": {
+                          "application/json": {
+                              "body": response_content
+                          }
+                      }
+                  },
+                  "sessionAttributes": session_attrs,
+                  "promptSessionAttributes": prompt_attrs
+              }
+
+  AllowBedrockToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MyActionLambda
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceArn: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/${MyBedrockAgent}
+
+  MyBedrockAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: "MsecIndustriesAgent"
+      Instruction: "You are a risk advisor that uses real-time analysis to evaluate political and economic risk for a given country."
+      FoundationModel: "amazon.nova-lite-v1:0"
+      IdleSessionTTLInSeconds: 300
+      AutoPrepare: true
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      ActionGroups:
+        - ActionGroupName: "RiskManagement"
+          Description: "Provides insight on political and economic risks by country."
+          ActionGroupExecutor:
+            Lambda: !GetAtt MyActionLambda.Arn
+          ApiSchema:
+            Payload: |
+              openapi: 3.0.0
+              info:
+                title: RiskBot API
+                version: "1.0"
+                description: Provides political and economic risk insights for a given country
+              paths:
+                /getPoliticalStability:
+                  post:
+                    operationId: getPoliticalStability
+                    description: Evaluate the political stability of a given country
+                    requestBody:
+                      required: true
+                      content:
+                        application/json:
+                          schema:
+                            type: object
+                            properties:
+                              country:
+                                type: string
+                                description: Country name
+                            required:
+                              - country
+                    responses:
+                      "200":
+                        description: Political stability assessment
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                politicalStability:
+                                  type: string
+                                  description: Evaluation of political environment
+                      "400":
+                        description: Invalid input
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                message:
+                                  type: string
+
+                /getEconomicRisk:
+                  post:
+                    operationId: getEconomicRisk
+                    description: Assess economic risks facing a country
+                    requestBody:
+                      required: true
+                      content:
+                        application/json:
+                          schema:
+                            type: object
+                            properties:
+                              country:
+                                type: string
+                                description: Country name
+                            required:
+                              - country
+                    responses:
+                      "200":
+                        description: Economic risk analysis
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                economicRisk:
+                                  type: string
+                                  description: Summary of economic risk factors
+                      "400":
+                        description: Invalid input
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                message:
+                                  type: string
+
+  MyAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentAliasName: "prod"
+      AgentId: !Ref MyBedrockAgent
+
+Outputs:
+  AgentId:
+    Value: !Ref MyBedrockAgent
+  AgentAliasId:
+    Value: !Ref MyAgentAlias
+  ActionFunctionArn:
+    Value: !GetAtt MyActionLambda.Arn
