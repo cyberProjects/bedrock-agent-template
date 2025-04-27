@@ -103,6 +103,7 @@ Outputs:
 
 ## 📊 Future Enhancements
 
+- Implement least privilege permissions.
 - Add more Action Groups for deeper country risk factors.
 - Implement logging of prompts and responses for audit trails.
 - Add fallback error handling and retry logic.
